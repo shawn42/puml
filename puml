@@ -1,0 +1,438 @@
+#!/usr/bin/env ruby
+
+require 'pry'
+require 'parser/current'
+require 'active_support/all'
+require 'set'
+require 'thor'
+
+# opt-in to most recent AST format:
+Parser::Builders::Default.emit_lambda   = true
+Parser::Builders::Default.emit_procarg0 = true
+Parser::Builders::Default.emit_encoding = true
+Parser::Builders::Default.emit_index    = true
+
+class PlantMLGenerator
+  def self.render_class(klass_repo, uml, klass_def, opts)
+    uml.puts "#{klass_def.type} #{klass_def.name} {"
+
+    if opts[:methods]
+      uml.puts ".. static .." unless klass_def.class_methods.empty?
+      klass_def.class_methods.sort.each do |cm|
+        uml.puts "+#{cm}()"
+      end
+      uml.puts ".. instance .." unless klass_def.public_methods.empty?
+      klass_def.public_methods.sort.each do |pm|
+        uml.puts "+#{pm}()"
+      end
+    end
+
+    uml.puts "}"
+
+    if opts[:parents]
+      if klass_def.parent
+        unless const_defined? klass_def.parent # ignore built-ins like StandardError
+          parent = klass_repo.find_klass klass_def.parent, klass_def.module
+          parent_name = parent ? parent.full_name : "#{klass_def.parent}"
+          unless const_defined?(parent_name)
+            if parent
+              uml.puts "#{parent_name.gsub("::",".")} <|-- #{klass_def.name}" 
+            else
+              uml.puts "External.#{parent_name.gsub("::",".")} <|-- #{klass_def.name}" 
+            end
+          end
+        end
+      end
+    end
+
+    if opts[:module_links]
+      klass_def.includes.to_a.select{|d|!d.blank?}.each do |dep|
+        unless const_defined? dep
+          child = klass_repo.find_klass "#{dep}::Mixin", klass_def.module
+          child_name = child ? child.full_name : "External.#{dep}"
+          uml.puts "#{klass_def.name} }-- #{child_name.gsub("::",".")}"
+        end
+      end
+      klass_def.extends.to_a.select{|d|!d.blank?}.each do |dep|
+        unless const_defined? dep
+          child = klass_repo.find_klass "#{dep}::Mixin", klass_def.module
+          child_name = child ? child.full_name : "External.#{dep}"
+          uml.puts "#{klass_def.name} #-- #{child_name.gsub("::",".")}"
+        end
+      end
+    end
+
+    if opts[:dep_guessing]
+      klass_def.deps.to_a.select{|d|!d.blank?}.each do |dep|
+        unless const_defined? dep
+          child = klass_repo.find_klass dep, klass_def.module
+          child_name = child ? child.full_name : "External.#{dep}"
+          uml.puts "#{klass_def.name} o-- #{child_name.gsub("::",".")}" if child
+        end
+      end
+    end
+
+
+    if opts[:news]
+      klass_def.news.to_a.select{|d|!d.blank?}.each do |dep|
+        unless const_defined? dep
+          child = klass_repo.find_klass dep, klass_def.module
+          child_name = child ? child.full_name : "External.#{dep}"
+          uml.puts "#{klass_def.name} +.. #{child_name.gsub("::",".")}" if child
+        end
+      end
+    end
+  end
+
+  def self.prerender_namespaces(klass_repo, uml)
+    klasses = klass_repo.klasses
+    includes = klass_repo.klasses.values.each_with_object([]) do |kdef, agg|
+      incs = kdef.includes
+      incs.each do |inc|
+        existing = klass_repo.find_klass("#{inc}::Mixin", kdef.module)
+        unless existing
+          agg << "External::#{inc}"
+        end
+      end
+    end
+    extends = klass_repo.klasses.values.each_with_object([]) do |kdef, agg|
+      exts = kdef.extends
+      exts.each do |ex|
+        existing = klass_repo.find_klass("#{ex}::Mixin", kdef.module)
+        unless existing
+          agg << "External::#{ex}"
+        end
+      end
+    end
+
+    # TODO group these
+    names = klass_repo.klasses.values.map(&:module) + includes + extends
+    names.uniq.reject(&:blank?).each do |mod|
+      pieces = mod.split("::")
+      pieces.each do |piece|
+        uml.puts "namespace #{piece} {"
+      end
+      pieces.size.times{ uml.puts "}" }
+    end
+  end
+
+  def self.render_module(klass_repo, uml, m, opts)
+    name = m[:name]
+    if name.present?
+      $package_counter ||= 0
+      # uml.puts "package #{name} as p#{$package_counter} {"
+      uml.puts "namespace #{name} {"
+      $package_counter += 1
+    end
+
+    m[:submods].each { |k, sm| 
+      render_module(klass_repo, uml, sm, opts) 
+    }
+    m[:classes].each { |kdef| render_class(klass_repo, uml, kdef, opts) }
+
+    if name.present?
+      uml.puts "}"
+    end
+  end
+
+  def self.generate(klass_repo, opts={})
+    uml = StringIO.new
+    prerender_namespaces klass_repo, uml
+
+    mods = klass_repo.walk_mods
+    render_module klass_repo, uml, mods, opts
+
+    unknowns = []
+
+    wrapper_uml = StringIO.new
+    wrapper_uml.puts "@startuml uml_diagram"
+    unknowns.uniq.each { |u| wrapper_uml.puts "class #{u}" }
+    wrapper_uml.puts uml.string
+    if opts[:hide] 
+      opts[:hide].each do |h|
+        wrapper_uml.puts "hide #{h}"
+      end
+    end
+    wrapper_uml.puts "@enduml"
+    wrapper_uml.string
+  end
+end
+
+class ClassFinder
+  def self.scan(repo, *files)
+    files.each do |file|
+      if File.directory? file
+        scan_dir repo, file
+      else
+        next unless file.ends_with? ".rb"
+        scan_file repo, file
+      end
+    end
+  end
+
+  def self.scan_file(repo, file)
+    begin
+      parsed = Parser::CurrentRuby.parse(File.read(file))
+      if parsed
+        ctx = {file: file}
+        process_node ctx, repo, parsed
+      else
+        puts "empty parsed returned? for #{file}"
+      end
+    rescue Parser::SyntaxError => e
+      puts "failed to parse: #{file}"
+    end
+  end
+
+  def self.process_def(ctx, repo, node)
+    klass_def = ctx[:klass_def]
+    meth_name = node.children.first.to_s
+    if klass_def 
+      klass_def.public_methods << meth_name unless ctx[:private]
+    elsif ctx[:module]
+      repo.add_module_method ctx[:module], meth_name
+    end
+    node.children.each { |child| process_node ctx, repo, child }
+  end
+
+  def self.process_defs(ctx, repo, node)
+    klass_def = ctx[:klass_def]
+    meth_name = node.children[1].to_s
+    klass_def.class_methods << meth_name if klass_def && !ctx[:private]
+    node.children.each { |child| process_node ctx, repo, child }
+  end
+
+  def self.process_node(ctx, repo, node)
+    if node && node.respond_to?(:type)
+      meth = "process_#{node.type}"
+      if respond_to? meth
+        send(meth, ctx, repo, node) 
+      else
+        node.children.each { |child| process_node ctx, repo, child }
+      end
+    end
+  end
+
+  def self.flatten_const_node(node, path=[])
+    if node.respond_to?(:type) && node.type == :const
+      path.unshift node.children.last
+      flatten_const_node(node.children.first, path)
+    end
+    path.join("::")
+  end
+
+  def self.process_send(ctx, repo, node)
+    target = node.children.first
+    meth_name = node.children[1]
+    klass_def = ctx[:klass_def]
+
+    if meth_name == :private
+      ctx[:private] = true
+    elsif meth_name == :include
+      if klass_def
+        mods_to_include = node.children[2..-1].map {|d|flatten_const_node d}
+        mods_to_include.each do |mod_to_include|
+          klass_def.includes << mod_to_include
+        end
+      end
+    elsif meth_name == :extend
+      if klass_def
+        mods_to_extend = node.children[2..-1].map {|d|flatten_const_node d}
+        mods_to_extend.each do |mod_to_extend|
+          klass_def.extends << mod_to_extend
+        end
+      end
+
+    elsif meth_name == :new
+      target_name = flatten_const_node target
+      # puts "NEW! #{klass_def ? klass_def.name : "NO CLASS"} #{target_name}.new"
+      klass_def.news << target_name if klass_def
+
+    elsif meth_name == :attr_reader || 
+      meth_name == :attr_accessor ||
+      meth_name == :attr_writer
+      dep_names = node.children[2..-1].map {|d|d.children.last.to_s.classify}
+      dep_names.each do |dep_name|
+        ctx[:klass_def].deps << dep_name if klass_def
+      end
+    end
+    node.children.each { |child| process_node ctx, repo, child }
+  end
+
+  def self.process_module(ctx, repo, node)
+    ctx[:module] ||= []
+    mod_name = node.children.first.children.last.to_s
+    # puts "module #{mod_name}"
+    ctx[:module] << mod_name
+    node.children.each { |child| process_node ctx, repo, child }
+    ctx[:module].pop
+    # puts "popped: #{ctx[:module]}"
+  end
+
+  def self.process_class(ctx, repo, node)
+    current_module = (ctx[:module] || []).join("::")
+    klass_name = node.children.first.children.last.to_s
+    full_name = current_module.empty? ? klass_name : "#{current_module}::#{klass_name}"
+
+    maybe_parent = node.children[1]
+
+    klass_def = ClassDef.new
+    if maybe_parent && maybe_parent.type == :const
+      # TODO get full path of parent (in case it's Thing < Foo::Bar, we want to capture the Foo)
+      parent_name = maybe_parent.children.last.to_s
+      # ignore built in classes like StandardError
+      # parent_name = const_defined?(parent_name) ? parent_name : "#{current_module}::#{parent_name}"
+      klass_def.parent = parent_name
+    end
+
+    klass_def.full_name = full_name
+    klass_def.name = klass_name
+    klass_def.module = current_module
+    prev = ctx[:klass_def]
+    ctx[:klass_def] = klass_def
+    node.children.each { |child| process_node ctx, repo, child }
+    ctx[:klass_def] = prev
+
+    repo.add_klass(klass_def)
+  end
+
+  def self.process_ivar(ctx, repo, node)
+    ivar_name = node.children.last.to_s[1..-1]
+    klass_def = ctx[:klass_def]
+    klass_def.deps << ivar_name.classify if klass_def
+  end
+
+  def self.scan_dir(repo, dir)
+    Dir["#{dir}/**/*.rb"].each do |f|
+      scan_file repo, f
+    end
+  end
+end
+
+class ClassDef
+  def initialize
+    @deps = Set.new
+    @news = Set.new
+    @mixins = Set.new
+    @public_methods = Set.new
+    @class_methods = Set.new
+    @includes = Set.new
+    @extends = Set.new
+    @type = :class # :interface
+  end
+  attr_accessor :full_name, :name, :module, :parent, :deps, :mixins,
+    :public_methods, :class_methods, :news, :includes, :extends, :type
+end
+
+class ClassRepo
+  attr_reader :klasses
+  def initialize
+    @klasses = {}
+  end
+
+  def find_klass(full_name, klass_module=nil)
+    if klass_module
+      pieces = klass_module.split "::"
+      pieces.size.times do |i|
+        name = (pieces[0..-(1+i)] + [full_name]).join("::")
+        maybe_klass = @klasses[name]
+        return maybe_klass if maybe_klass
+      end
+    end
+    @klasses[full_name]
+  end
+
+  def add_klass(klass_def)
+    @klasses[klass_def.full_name] = klass_def
+  end
+
+  def add_module_method(mod, meth)
+    mod_name = mod.join('::')
+    interface_name = "#{mod_name}::Mixin"
+    kdef = find_klass(interface_name)
+    unless kdef
+      kdef = ClassDef.new
+      kdef.full_name = interface_name
+      kdef.name = "Mixin"
+      kdef.module = mod_name
+      kdef.type = :interface
+      add_klass kdef
+    end
+    kdef.public_methods << meth
+
+  end
+
+  def walk_mods
+    top_level = {
+      name: '',
+      submods: {},
+      classes: []
+    }
+    @klasses.values.each do |kdef|
+      pieces = kdef.module.split("::")#.reject(&:blank?)
+
+      last_mod = top_level
+      
+      pieces.each do |m|
+        unless last_mod[:submods].key? m
+          new_mod = {
+            name: m,
+            submods: {},
+            classes: []
+          }
+          last_mod[:submods][m] = new_mod
+        end
+
+        last_mod = last_mod[:submods][m]
+      end
+
+      last_mod[:classes] << kdef
+
+    end
+    top_level
+  end
+end
+
+class Cli < Thor
+  option :out, alias: '-o', type: :string, default: "out.plantuml", banner: "name of output file"
+  option :hide, type: :string, default: "", banner: "comma sep list of namespaces to ignore"
+  option :news, type: :boolean, default: false, banner: "show 'new' calls as deps"
+  option :methods, type: :boolean, default: false, banner: "show methods"
+  option :parents, type: :boolean, default: false, banner: "show parent releationships"
+  option :module_links, type: :boolean, default: false, banner: "draw relationships with includes/extended modules"
+  option :dep_guessing, type: :boolean, default: false, banner: "guess 'has a' based in ivars and attrs"
+
+  desc 'scan', 'scans FILES or directories for UML generation'
+  def scan(*files)
+    # more efficient grouping when prewriting namespaces
+    # modules can include modules... UG
+    # proper options for
+    #   object creation only
+    #   inheritance only
+    #   no methods
+    #   just gather stats and report on bad classes / patterns?
+
+    klasses = ClassRepo.new.tap do |repo|
+      to_scan = files
+      to_scan << "." if to_scan.empty?
+      ClassFinder.scan repo, *to_scan
+    end
+
+    m = klasses.walk_mods
+    plant_uml = PlantMLGenerator.generate klasses, 
+      hide: options[:hide].split(','), 
+      news: options[:news],
+      dep_guessing: options[:dep_guessing],
+      parents: options[:parents],
+      methods: options[:methods],
+      module_links: options[:module_links]
+
+    File.open(options[:out], "w+") do |f|
+      f.puts plant_uml
+    end
+  end
+end
+if $0 == __FILE__
+  Cli.start(ARGV)
+end
+
